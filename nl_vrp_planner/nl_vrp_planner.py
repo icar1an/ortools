@@ -1,5 +1,3 @@
-# Strategic VRP Planner for NYC Poster Campaign
-#
 # This advanced script uses a powerful generative model (Gemini 2.5 Pro) to devise a
 # campaign strategy from a high-level goal, then executes that strategy by planning
 # an optimized VRP for multiple teams with multiple constraints (time and posters).
@@ -39,9 +37,10 @@ except Exception:
 ############################################################################
 
 # --- API Keys ---
-# You must enable: "Distance Matrix API", "Places API", and "Generative Language API"
+# You must enable: "Places API" and "Generative Language API". "Distance Matrix API" is optional
+# and only used when VRP_USE_DISTANCE_MATRIX=1.
 # Provide via environment variables (preferably using a local .env for development)
-#   - GOOGLE_MAPS_API_KEY: for Maps Distance Matrix and Places (New) APIs
+#   - GOOGLE_MAPS_API_KEY: for Places (New) API and optional Distance Matrix
 #   - GEMINI_API_KEY: for Generative Language API (Gemini)
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GOOGLE_MAPS_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
@@ -84,6 +83,9 @@ DRIVE_SPEED_MPS = float(os.getenv('VRP_DRIVE_SPEED_MPS', '11.0'))     # ~40 km/h
 TRANSIT_OVERHEAD_SECONDS = int(os.getenv('VRP_TRANSIT_OVERHEAD_SEC', '300'))
 # VRP_DRIVE_OVERHEAD_SEC: fixed seconds added to driving fallback (parking etc.)
 DRIVE_OVERHEAD_SECONDS = int(os.getenv('VRP_DRIVE_OVERHEAD_SEC', '120'))
+
+# VRP_USE_DISTANCE_MATRIX: if true, use Google Distance Matrix API (costly). Defaults off.
+USE_DISTANCE_MATRIX = os.getenv('VRP_USE_DISTANCE_MATRIX', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 
 # --- Dynamic poster/time scaling configuration ---
 # VRP_POPULARITY_MAX: cap for review-count normalization (higher = less saturation)
@@ -609,83 +611,87 @@ def build_time_matrix(gmaps, data):
                 mode_matrix[i][j] = mode
                 modes_needed.add(mode)
 
-        # Safe cap for elements per request. Distance Matrix commonly limits to ~100 elements/request.
-        max_elements_per_request = 100
-        batch_size = min(n, int(max_elements_per_request ** 0.5) or 1)
-
-        # Initialize full matrices for each mode and final matrix (diagonal stays 0)
-        dm_time_by_mode = {m: [[None for _ in range(n)] for _ in range(n)] for m in modes_needed}
+        # Initialize final matrix (diagonal stays 0)
         final_matrix = [[0 for _ in range(n)] for _ in range(n)]
 
-        # Helper to call Distance Matrix for a given mode and fill dm_time_by_mode
-        def cache_key_for_dm(origins, destinations, mode):
-            m = hashlib.sha256()
-            m.update(('|'.join(origins) + '||' + '|'.join(destinations) + f'||{mode}').encode('utf-8'))
-            return m.hexdigest()
+        # Optionally populate API-based durations if enabled; otherwise rely on local estimates only
+        dm_time_by_mode = {}
+        if USE_DISTANCE_MATRIX:
+            # Safe cap for elements per request. Distance Matrix commonly limits to ~100 elements/request.
+            max_elements_per_request = 100
+            batch_size = min(n, int(max_elements_per_request ** 0.5) or 1)
 
-        def fill_dm_for_mode(mode):
-            for i_start in range(0, n, batch_size):
-                origins = addresses[i_start:i_start + batch_size]
-                for j_start in range(0, n, batch_size):
-                    destinations = addresses[j_start:j_start + batch_size]
+            # Initialize full matrices for each mode
+            dm_time_by_mode = {m: [[None for _ in range(n)] for _ in range(n)] for m in modes_needed}
 
-                    kwargs = { 'origins': origins, 'destinations': destinations, 'mode': mode }
-                    if mode == 'transit':
-                        kwargs['departure_time'] = 'now'
-                        kwargs['transit_mode'] = 'subway'
-                    # For driving we could add traffic model if desired.
+            # Helper to call Distance Matrix for a given mode and fill dm_time_by_mode
+            def cache_key_for_dm(origins, destinations, mode):
+                m = hashlib.sha256()
+                m.update(('|'.join(origins) + '||' + '|'.join(destinations) + f'||{mode}').encode('utf-8'))
+                return m.hexdigest()
 
-                    key = cache_key_for_dm(origins, destinations, mode)
-                    cache_path = Path(CACHE_DIR) / f"dm_{key}.json"
-                    now = time.time()
-                    response = None
+            def fill_dm_for_mode(mode):
+                for i_start in range(0, n, batch_size):
+                    origins = addresses[i_start:i_start + batch_size]
+                    for j_start in range(0, n, batch_size):
+                        destinations = addresses[j_start:j_start + batch_size]
 
-                    # Cache read
-                    try:
-                        if cache_path.exists() and (now - cache_path.stat().st_mtime) <= CACHE_TTL_SEC:
-                            with open(cache_path, 'r') as f:
-                                response = json.load(f)
-                    except Exception:
+                        kwargs = { 'origins': origins, 'destinations': destinations, 'mode': mode }
+                        if mode == 'transit':
+                            kwargs['departure_time'] = 'now'
+                            kwargs['transit_mode'] = 'subway'
+
+                        key = cache_key_for_dm(origins, destinations, mode)
+                        cache_path = Path(CACHE_DIR) / f"dm_{key}.json"
+                        now = time.time()
                         response = None
 
-                    # Live call with retries/backoff if no cache
-                    if response is None:
-                        attempt = 0
-                        while attempt <= API_MAX_RETRIES:
-                            try:
-                                response = gmaps.distance_matrix(**kwargs)
-                                # Cache write best-effort
+                        # Cache read
+                        try:
+                            if cache_path.exists() and (now - cache_path.stat().st_mtime) <= CACHE_TTL_SEC:
+                                with open(cache_path, 'r') as f:
+                                    response = json.load(f)
+                        except Exception:
+                            response = None
+
+                        # Live call with retries/backoff if no cache
+                        if response is None:
+                            attempt = 0
+                            while attempt <= API_MAX_RETRIES:
                                 try:
-                                    with open(cache_path, 'w') as f:
-                                        json.dump(response, f)
+                                    response = gmaps.distance_matrix(**kwargs)
+                                    # Cache write best-effort
+                                    try:
+                                        with open(cache_path, 'w') as f:
+                                            json.dump(response, f)
+                                    except Exception:
+                                        pass
+                                    break
+                                except Exception:
+                                    attempt += 1
+                                    if attempt > API_MAX_RETRIES:
+                                        response = {'rows': []}
+                                        break
+                                    backoff = (API_BACKOFF_BASE_MS / 1000.0) * (2 ** (attempt - 1)) * (1 + random.random())
+                                    time.sleep(backoff)
+
+                        rows = response.get('rows', []) if isinstance(response, dict) else []
+                        for oi, row in enumerate(rows):
+                            elements = row.get('elements', [])
+                            for di_idx, elem in enumerate(elements):
+                                gi = i_start + oi
+                                gj = j_start + di_idx
+                                if gi == gj:
+                                    continue
+                                try:
+                                    status = elem.get('status', 'OK')
+                                    if status == 'OK' and 'duration' in elem and 'value' in elem['duration']:
+                                        dm_time_by_mode[mode][gi][gj] = int(elem['duration']['value'])
                                 except Exception:
                                     pass
-                                break
-                            except Exception:
-                                attempt += 1
-                                if attempt > API_MAX_RETRIES:
-                                    response = {'rows': []}
-                                    break
-                                backoff = (API_BACKOFF_BASE_MS / 1000.0) * (2 ** (attempt - 1)) * (1 + random.random())
-                                time.sleep(backoff)
 
-                    rows = response.get('rows', []) if isinstance(response, dict) else []
-                    for oi, row in enumerate(rows):
-                        elements = row.get('elements', [])
-                        for di_idx, elem in enumerate(elements):
-                            gi = i_start + oi
-                            gj = j_start + di_idx
-                            if gi == gj:
-                                continue
-                            try:
-                                status = elem.get('status', 'OK')
-                                if status == 'OK' and 'duration' in elem and 'value' in elem['duration']:
-                                    dm_time_by_mode[mode][gi][gj] = int(elem['duration']['value'])
-                            except Exception:
-                                pass
-
-        for mode in modes_needed:
-            fill_dm_for_mode(mode)
+            for mode in modes_needed:
+                fill_dm_for_mode(mode)
 
         # Compose final matrix with chosen mode per pair; fallback via haversine speed model
         for i in range(n):
