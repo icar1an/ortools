@@ -1,4 +1,4 @@
-## NL VRP Planner
+## NL VRP Planner (warning: quite expensive to run)
 
 Turn a natural-language campaign goal into an executable multi-constraint vehicle routing plan. The pipeline:
 - Strategic plan via Gemini → targeted campus queries
